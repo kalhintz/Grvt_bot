@@ -24,7 +24,7 @@ eth-account>=0.11.0
 ### 1. 저장소 클론
 ```bash
 git clone https://github.com/kalhintz/Grvt_bot.git
-cd [your-repo-name]
+cd Grvt_bot
 ```
 
 ### 2. Python 환경 설정 (Python 3.10+ 권장)
