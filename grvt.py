@@ -171,10 +171,13 @@ class GRVT:
     async def start_market_data(self):
         """마켓 데이터 구독 (자동 재연결)"""
         url = "wss://market-data.grvt.io/ws/full"
+
+        # selector 형식: instrument@rate-depth (depth: 10, 50, 100, 500)
+        selector = f"{self.instrument}@500-50"
         sub_msg = {
             "jsonrpc": "2.0",
             "method": "subscribe",
-            "params": {"stream": "v1.book.s", "selectors": [f"{self.instrument}@500-10"]},
+            "params": {"stream": "v1.book.s", "selectors": [selector]},
             "id": 1
         }
 
@@ -183,22 +186,39 @@ class GRVT:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=10) as ws:
                     await ws.send(json.dumps(sub_msg))
-                    self.log.info("✅ GRVT 마켓 데이터 구독")
-                    reconnect_count = 0  # 성공 시 카운터 리셋
+                    self.log.info(f"✅ GRVT 마켓 데이터 구독: {selector}")
+                    reconnect_count = 0
 
                     async for raw in ws:
-                        msg = json.loads(raw)
-                        if msg.get("stream") == "v1.book.s":
-                            self._update_orderbook(msg.get("feed", {}))
+                        try:
+                            msg = json.loads(raw)
+
+                            # 에러 체크
+                            if "error" in msg:
+                                self.log.error(f"GRVT WS 에러: {msg['error']}")
+                                continue
+
+                            # 구독 응답 확인
+                            if "result" in msg and msg.get("method") == "subscribe":
+                                self.log.info(f"구독 확인: {msg['result'].get('subs', [])}")
+                                continue
+
+                            # 오더북 데이터
+                            if msg.get("stream") == "v1.book.s":
+                                feed = msg.get("feed", {})
+                                if feed:
+                                    self._update_orderbook(feed)
+
+                        except json.JSONDecodeError as e:
+                            self.log.warning(f"JSON 파싱 실패: {e}")
 
             except ConnectionClosed as e:
-                self.log.warning(f"GRVT 마켓 데이터 연결 끊김: {e}")
+                self.log.warning(f"GRVT 마켓 데이터 연결 끊김: code={e.code} reason={e.reason}")
                 reconnect_count += 1
             except Exception as e:
-                self.log.error(f"GRVT 마켓 데이터 오류: {e}")
+                self.log.error(f"GRVT 마켓 데이터 오류: {type(e).__name__}: {e}")
                 reconnect_count += 1
 
-            # 재연결 대기 (지수 백오프)
             wait_time = min(60, 2 ** min(reconnect_count, 6))
             self.log.info(f"GRVT 마켓 데이터 재연결 대기 {wait_time}초...")
             await asyncio.sleep(wait_time)
@@ -206,7 +226,6 @@ class GRVT:
     async def start_private_data(self):
         """포지션/체결 구독 (자동 재연결)"""
         url = "wss://trades.grvt.io/ws/full"
-        headers = [("Cookie", self.cookie), ("X-Grvt-Account-Id", self.api_key)]
         selector = f"{self.sub}-{self.instrument}"
 
         subs = [
@@ -219,17 +238,23 @@ class GRVT:
         reconnect_count = 0
         while True:
             try:
-                # 쿠키 갱신이 필요할 수 있음
+                # 쿠키 갱신
                 if reconnect_count > 0 and reconnect_count % 3 == 0:
                     self.log.info("GRVT 재로그인 시도...")
                     try:
                         self.login()
-                        headers = [("Cookie", self.cookie), ("X-Grvt-Account-Id", self.api_key)]
                     except Exception as e:
                         self.log.error(f"재로그인 실패: {e}")
 
-                async with websockets.connect(url, extra_headers=headers,
-                                             ping_interval=20, ping_timeout=10) as ws:
+                # websockets 버전 호환성 처리
+                headers = {"Cookie": self.cookie, "X-Grvt-Account-Id": self.api_key}
+
+                async with websockets.connect(
+                    url,
+                    additional_headers=headers,  # websockets >= 10.0
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as ws:
                     for sub in subs:
                         await ws.send(json.dumps(sub))
 
@@ -237,37 +262,139 @@ class GRVT:
                     reconnect_count = 0
 
                     async for raw in ws:
-                        msg = json.loads(raw)
-                        stream = msg.get("stream")
+                        try:
+                            msg = json.loads(raw)
 
-                        if stream == "v1.position":
-                            self._update_position(msg.get("feed", {}))
-                        elif stream == "v1.fill":
-                            self._handle_fill(msg.get("feed", {}))
+                            # 에러 체크
+                            if "error" in msg:
+                                self.log.error(f"GRVT Private WS 에러: {msg['error']}")
+                                continue
+
+                            stream = msg.get("stream")
+
+                            if stream == "v1.position":
+                                self._update_position(msg.get("feed", {}))
+                            elif stream == "v1.fill":
+                                self._handle_fill(msg.get("feed", {}))
+
+                        except json.JSONDecodeError as e:
+                            self.log.warning(f"JSON 파싱 실패: {e}")
 
             except ConnectionClosed as e:
-                self.log.warning(f"GRVT 프라이빗 데이터 연결 끊김: {e}")
+                self.log.warning(f"GRVT 프라이빗 데이터 연결 끊김: code={e.code} reason={e.reason}")
+                reconnect_count += 1
+            except TypeError as e:
+                # websockets 버전 호환성 - extra_headers 시도
+                if "additional_headers" in str(e) or "extra_headers" in str(e):
+                    self.log.warning("websockets 버전 호환성 문제 감지, 대체 방식 시도")
+                    try:
+                        await self._start_private_data_legacy()
+                        return
+                    except Exception as e2:
+                        self.log.error(f"레거시 방식도 실패: {e2}")
+                else:
+                    self.log.error(f"GRVT 프라이빗 데이터 오류: {type(e).__name__}: {e}")
                 reconnect_count += 1
             except Exception as e:
-                self.log.error(f"GRVT 프라이빗 데이터 오류: {e}")
+                self.log.error(f"GRVT 프라이빗 데이터 오류: {type(e).__name__}: {e}")
                 reconnect_count += 1
 
             wait_time = min(60, 2 ** min(reconnect_count, 6))
             self.log.info(f"GRVT 프라이빗 데이터 재연결 대기 {wait_time}초...")
             await asyncio.sleep(wait_time)
 
+    async def _start_private_data_legacy(self):
+        """레거시 websockets 호환 (extra_headers 사용)"""
+        url = "wss://trades.grvt.io/ws/full"
+        selector = f"{self.sub}-{self.instrument}"
+
+        subs = [
+            {"jsonrpc": "2.0", "method": "subscribe",
+             "params": {"stream": "v1.position", "selectors": [selector]}, "id": 101},
+            {"jsonrpc": "2.0", "method": "subscribe",
+             "params": {"stream": "v1.fill", "selectors": [selector]}, "id": 102}
+        ]
+
+        reconnect_count = 0
+        while True:
+            try:
+                if reconnect_count > 0 and reconnect_count % 3 == 0:
+                    try:
+                        self.login()
+                    except:
+                        pass
+
+                headers = [("Cookie", self.cookie), ("X-Grvt-Account-Id", self.api_key)]
+
+                async with websockets.connect(
+                    url,
+                    extra_headers=headers,  # websockets < 10.0
+                    ping_interval=20,
+                    ping_timeout=10
+                ) as ws:
+                    for sub in subs:
+                        await ws.send(json.dumps(sub))
+
+                    self.log.info("✅ GRVT 프라이빗 데이터 구독 (레거시)")
+                    reconnect_count = 0
+
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                            stream = msg.get("stream")
+
+                            if stream == "v1.position":
+                                self._update_position(msg.get("feed", {}))
+                            elif stream == "v1.fill":
+                                self._handle_fill(msg.get("feed", {}))
+                        except:
+                            pass
+
+            except Exception as e:
+                self.log.error(f"레거시 프라이빗 오류: {e}")
+                reconnect_count += 1
+
+            await asyncio.sleep(min(60, 2 ** min(reconnect_count, 6)))
+
     def _update_orderbook(self, feed: Dict):
         """오더북 업데이트"""
-        bids = feed.get("bids", [])
-        asks = feed.get("asks", [])
+        try:
+            bids = feed.get("bids", [])
+            asks = feed.get("asks", [])
 
-        if bids:
-            self.best_bid = float(bids[0][0])
-        if asks:
-            self.best_ask = float(asks[0][0])
+            # 디버그: 실제 데이터 구조 확인
+            if bids and not self.market_ready.is_set():
+                self.log.info(f"🔍 오더북 구조: bids[0]={bids[0] if bids else 'empty'}")
 
-        if self.best_bid and self.best_ask and not self.market_ready.is_set():
-            self.market_ready.set()
+            if bids:
+                # 구조에 따라 파싱
+                first_bid = bids[0]
+                if isinstance(first_bid, dict):
+                    # {"price": "123", "size": "456"} 형태
+                    self.best_bid = float(first_bid.get("price") or first_bid.get("p", 0))
+                elif isinstance(first_bid, (list, tuple)):
+                    # [price, size] 형태
+                    self.best_bid = float(first_bid[0])
+                else:
+                    # 단일 값?
+                    self.best_bid = float(first_bid)
+
+            if asks:
+                first_ask = asks[0]
+                if isinstance(first_ask, dict):
+                    self.best_ask = float(first_ask.get("price") or first_ask.get("p", 0))
+                elif isinstance(first_ask, (list, tuple)):
+                    self.best_ask = float(first_ask[0])
+                else:
+                    self.best_ask = float(first_ask)
+
+            if self.best_bid and self.best_ask:
+                if not self.market_ready.is_set():
+                    self.log.info(f"📊 호가: bid={self.best_bid:.2f} ask={self.best_ask:.2f}")
+                    self.market_ready.set()
+
+        except Exception as e:
+            self.log.error(f"오더북 파싱 오류: {e}, feed={json.dumps(feed)[:500]}")
 
     def _update_position(self, feed: Dict):
         """포지션 업데이트"""
@@ -285,7 +412,9 @@ class GRVT:
     async def place_order(self, side: str, price: float, qty: float) -> Optional[str]:
         """주문 전송"""
         try:
-            # 가격/수량 정량화
+            from dataclasses import asdict
+            from enum import Enum
+
             price = quantize(price, self.config.GRVT_TICK)
             qty = quantize(qty, self.config.GRVT_MIN_SIZE)
 
@@ -293,41 +422,85 @@ class GRVT:
                 self.log.warning(f"수량 부족: {qty} < {self.config.GRVT_MIN_SIZE}")
                 return None
 
-            # 주문 생성
+            # 간단한 숫자 ID 사용 (API 예제처럼)
+            client_order_id = str(int(time.time() * 1000))
+            now_ns = int(time.time() * 1e9)
+            expiration_int = int((time.time() + 3600) * 1e9)
+
             leg = OrderLeg(
-                instrument=self.instrument_obj.instrument,
+                instrument=self.instrument,
                 size=str(qty),
                 limit_price=str(price),
                 is_buying_asset=(side == "buy")
             )
 
-            order_id = str(uuid.uuid4())
+            dummy_sig = Signature(
+                signer="",
+                r="",
+                s="",
+                v=0,
+                expiration=expiration_int,
+                nonce=random.randint(1, 2**31 - 1)
+            )
+
             order = Order(
-                order_id=order_id,
+                order_id=client_order_id,
                 sub_account_id=self.sub,
                 is_market=False,
                 time_in_force=TimeInForce.GOOD_TILL_TIME,
                 legs=[leg],
                 metadata=OrderMetadata(
-                    client_order_id=order_id,
-                    create_time=str(int(time.time() * 1e6))
+                    client_order_id=client_order_id,
+                    create_time=str(now_ns)
                 ),
+                signature=dummy_sig,
                 post_only=False,
                 reduce_only=False
             )
 
-            # 서명
-            signature = sign_order(
+            instruments_dict = {self.instrument: self.instrument_obj}
+
+            signed_order = sign_order(
                 order=order,
-                private_key=self.sdk_cfg.private_key,
-                is_market=False
+                config=self.sdk_cfg,
+                account=self.acct,
+                instruments=instruments_dict
             )
 
-            # API 요청
+            # dict 변환
+            try:
+                order_dict = signed_order.model_dump()
+            except AttributeError:
+                order_dict = asdict(signed_order)
+
+            # Enum을 문자열로 변환하고 None 제거
+            def convert_and_clean(obj):
+                if isinstance(obj, dict):
+                    return {k: convert_and_clean(v) for k, v in obj.items() if v is not None}
+                elif isinstance(obj, list):
+                    return [convert_and_clean(item) for item in obj]
+                elif isinstance(obj, Enum):
+                    return obj.name
+                else:
+                    return obj
+
+            order_dict = convert_and_clean(order_dict)
+
+            # order_id 제거
+            order_dict.pop("order_id", None)
+
+            # signature 안의 expiration을 문자열로 변환
+            if "signature" in order_dict:
+                sig = order_dict["signature"]
+                if "expiration" in sig and not isinstance(sig["expiration"], str):
+                    sig["expiration"] = str(sig["expiration"])
+
             payload = {
-                "order": order.model_dump(),
-                "signature": signature.model_dump()
+                "order": order_dict
             }
+
+            # 디버그
+            self.log.info(f"🔍 payload: {json.dumps(payload)[:800]}")
 
             r = requests.post(
                 "https://trades.grvt.io/full/v1/create_order",
@@ -337,15 +510,18 @@ class GRVT:
             )
 
             if r.status_code == 200:
-                result = r.json().get("result", {})
+                result = r.json()
+                if "error" in result:
+                    self.log.error(f"주문 API 에러: {result['error']}")
+                    return None
                 self.log.info(f"📝 GRVT 주문 전송: {side} {qty:.6f} @ {price:.2f}")
-                return result.get("order_id")
+                return result.get("result", {}).get("order_id")
             else:
-                self.log.error(f"주문 실패: {r.status_code} {r.text}")
+                self.log.error(f"주문 실패: {r.status_code} {r.text[:300]}")
                 return None
 
         except Exception as e:
-            self.log.error(f"주문 오류: {e}")
+            self.log.error(f"주문 오류: {type(e).__name__}: {e}")
             return None
 
     async def cancel_all_orders(self):
@@ -369,11 +545,9 @@ class GRVT:
     async def manage_position(self, side: str, qty: float) -> bool:
         """포지션 관리 (진입)"""
         try:
-            # 기존 주문 취소
             await self.cancel_all_orders()
             await asyncio.sleep(1)
 
-            # 가격 결정
             if side == "buy":
                 price = self.best_ask if self.best_ask else None
             else:
@@ -383,18 +557,16 @@ class GRVT:
                 self.log.warning("호가 정보 없음")
                 return False
 
-            # 공격적 가격 (즉시 체결 유도)
+            # 공격적 가격
             if side == "buy":
                 price = price * 1.001
             else:
                 price = price * 0.999
 
-            # 주문 전송
             order_id = await self.place_order(side, price, qty)
             if not order_id:
                 return False
 
-            # 체결 대기 (최대 30초)
             target_pos = qty if side == "buy" else -qty
             for _ in range(30):
                 await asyncio.sleep(1)
@@ -417,15 +589,12 @@ class GRVT:
                 self.log.info("청산할 포지션 없음")
                 return True
 
-            # 기존 주문 취소
             await self.cancel_all_orders()
             await asyncio.sleep(1)
 
-            # 청산 방향/수량
             side = "sell" if self.position > 0 else "buy"
             qty = abs(self.position)
 
-            # 가격 결정
             if side == "buy":
                 price = self.best_ask if self.best_ask else None
             else:
@@ -435,18 +604,15 @@ class GRVT:
                 self.log.warning("호가 정보 없음")
                 return False
 
-            # 공격적 가격
             if side == "buy":
                 price = price * 1.001
             else:
                 price = price * 0.999
 
-            # 청산 주문
             order_id = await self.place_order(side, price, qty)
             if not order_id:
                 return False
 
-            # 체결 대기
             for _ in range(30):
                 await asyncio.sleep(1)
                 if abs(self.position) < self.config.GRVT_MIN_SIZE:
@@ -479,7 +645,6 @@ class TradingEngine:
         await self.grvt.market_ready.wait()
         self.log.info("✅ 시장 준비 완료")
 
-        # 초기 정리
         self.log.info("🧹 포지션 정리 중...")
         await self.grvt.close_position()
         await asyncio.sleep(3)
@@ -490,23 +655,19 @@ class TradingEngine:
                     await asyncio.sleep(1)
                     continue
 
-                # 주기적 상태 로그
                 if int(time.time()) % 30 == 0:
                     runtime = int(time.time() - self.start_time)
                     hours = runtime // 3600
                     minutes = (runtime % 3600) // 60
                     self.log.info(f"📊 상태: 사이클={self.cycle_count} 런타임={hours}h{minutes}m")
 
-                # 거래 로직 (예시: 단순히 포지션 열고 닫기)
                 if not self.grvt.best_bid or not self.grvt.best_ask:
                     await asyncio.sleep(1)
                     continue
 
-                # 거래 수량 계산
                 ref_price = self.grvt.best_ask
                 qty = quantize(self.config.NOTIONAL_USD / ref_price, self.config.GRVT_MIN_SIZE)
 
-                # 랜덤 방향 선택 (실제 전략으로 교체 필요)
                 side = random.choice(["buy", "sell"])
 
                 self.active = True
@@ -517,19 +678,16 @@ class TradingEngine:
                 self.log.info(f"   수량: {qty:.6f} BTC @ {ref_price:.2f}")
                 self.log.info("=" * 70)
 
-                # 진입
                 ok = await self.grvt.manage_position(side, qty)
                 if not ok:
                     self.log.error("진입 실패")
                     self.active = False
                     continue
 
-                # 홀드
                 hold_time = random.randint(self.config.POSITION_HOLD_MIN, self.config.POSITION_HOLD_MAX)
                 self.log.info(f"⏳ {hold_time}초 홀드")
                 await asyncio.sleep(hold_time)
 
-                # 청산
                 self.log.info("🔚 포지션 청산 시작")
                 await self.grvt.close_position()
 
@@ -557,16 +715,13 @@ async def main():
     log.info(f"📍 시작 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     log.info("=" * 70)
 
-    # GRVT 초기화
     grvt = GRVT(setup_logger("GRVT"))
     grvt.login()
     grvt.fetch_instrument()
 
-    # 비동기 태스크 시작
     asyncio.create_task(grvt.start_market_data())
     asyncio.create_task(grvt.start_private_data())
 
-    # 트레이딩 엔진 실행
     engine = TradingEngine(grvt, setup_logger("ENGINE"))
     await engine.run()
 
